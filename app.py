@@ -8,6 +8,9 @@ import numpy as np
 import csv
 import os
 
+os.makedirs("static", exist_ok=True)
+os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
+
 torch.serialization.add_safe_globals([DetectionModel])
 
 app = Flask(__name__)
