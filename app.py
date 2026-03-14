@@ -1,22 +1,31 @@
 from flask import Flask, render_template, request, Response
 from ultralytics import YOLO
 import cv2
-import os
-import csv
+from ultralytics.nn.tasks import DetectionModel
+import torch.serialization
 import numpy as np
+import csv
+import os
 
-# Fix Ultralytics config warning
+# ---- Deployment fixes ----
+os.makedirs("static", exist_ok=True)
 os.environ["YOLO_CONFIG_DIR"] = "/tmp/Ultralytics"
 
-# Ensure static folder exists
-os.makedirs("static", exist_ok=True)
+torch.serialization.add_safe_globals([DetectionModel])
 
 app = Flask(__name__)
 model = None
 
+# --------------------
+# Globals for persistent tracking
+# --------------------
+next_id = 0
+tracked_potholes = {}
+iou_threshold = 0.3
+max_lost_frames = 5
 
 # --------------------
-# Load YOLO model
+# Model loader
 # --------------------
 def get_model():
     global model
@@ -24,9 +33,8 @@ def get_model():
         model = YOLO("best.pt")
     return model
 
-
 # --------------------
-# Pothole information
+# Pothole info
 # --------------------
 def pothole_info(area_px):
     area_sq_m = area_px / 10000
@@ -37,16 +45,30 @@ def pothole_info(area_px):
     else:
         return "Large", (0,0,255), area_sq_m, "High"
 
-
 def pothole_speed(area_px):
     size,_,_,_ = pothole_info(area_px)
-    if size=="Small":
+    if size == "Small":
         return 50
-    elif size=="Medium":
+    elif size == "Medium":
         return 30
     else:
         return 15
 
+def pothole_distance(x1,x2,fps=30,speed_kmh=40):
+    focal_length = 800
+    real_width = 0.6
+    box_width = x2-x1
+
+    if box_width == 0:
+        return 0
+
+    distance = (real_width * focal_length) / box_width
+    distance -= (speed_kmh * 1000 / 3600) / fps
+
+    if distance < 0:
+        distance = 0
+
+    return round(distance,2)
 
 def pothole_depth(area_px):
     if area_px < 3000:
@@ -56,100 +78,238 @@ def pothole_depth(area_px):
     else:
         return 20
 
+# --------------------
+# IOU
+# --------------------
+def iou(box1,box2):
 
-def pothole_distance(x1,x2):
-    focal_length = 800
-    real_width = 0.6
-    box_width = x2-x1
-    if box_width==0:
-        return 0
-    distance=(real_width*focal_length)/box_width
-    return round(distance,2)
+    xA = max(box1[0],box2[0])
+    yA = max(box1[1],box2[1])
+    xB = min(box1[2],box2[2])
+    yB = min(box1[3],box2[3])
 
+    interArea = max(0,xB-xA) * max(0,yB-yA)
+
+    box1Area = (box1[2]-box1[0])*(box1[3]-box1[1])
+    box2Area = (box2[2]-box2[0])*(box2[3]-box2[1])
+
+    return interArea / float(box1Area + box2Area - interArea + 1e-6)
 
 # --------------------
-# Image Detection
+# Video generator
 # --------------------
-@app.route("/", methods=["GET","POST"])
+def generate_frames(video_path):
+
+    global next_id,tracked_potholes
+
+    cap = cv2.VideoCapture(video_path)
+    model = get_model()
+
+    log_file = "static/potholes_log.csv"
+
+    if os.path.exists(log_file):
+        os.remove(log_file)
+
+    csvfile = open(log_file,"w",newline="")
+    csvwriter = csv.writer(csvfile)
+
+    csvwriter.writerow(["Pothole_ID","Frame","Size","Depth(cm)","Severity","Distance(m)"])
+
+    frame_num = 0
+    unique_ids = set()
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0:
+        fps = 30
+
+    while True:
+
+        ret,frame = cap.read()
+        if not ret:
+            break
+
+        frame_num += 1
+        speeds = []
+
+        results = model(frame,conf=0.4,imgsz=416)
+
+        detections = []
+
+        for r in results:
+            for box in r.boxes.xyxy:
+                x1,y1,x2,y2 = map(int,box)
+                detections.append([x1,y1,x2,y2])
+
+        new_tracked = {}
+
+        for det in detections:
+
+            assigned_id = None
+
+            for track_id,(tbox,last_seen) in tracked_potholes.items():
+
+                if iou(det,tbox) > iou_threshold:
+                    assigned_id = track_id
+                    break
+
+            if assigned_id is None:
+                assigned_id = next_id
+                next_id += 1
+
+            new_tracked[assigned_id] = [det,frame_num]
+            unique_ids.add(assigned_id)
+
+        tracked_potholes = {
+            tid:val for tid,val in new_tracked.items()
+            if frame_num - val[1] <= max_lost_frames
+        }
+
+        for track_id,(box,_) in tracked_potholes.items():
+
+            x1,y1,x2,y2 = box
+
+            box_width = x2-x1
+            area_px = box_width * (y2-y1)
+
+            size,color,area_sq_m,severity = pothole_info(area_px)
+
+            depth = pothole_depth(area_px)
+
+            distance = pothole_distance(x1,x2,fps)
+
+            cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
+
+            start_y = y2+20
+
+            cv2.putText(frame,f"ID:{track_id} {size} | {severity} | Distance:{distance}m",
+                        (x1+5,start_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+
+            cv2.putText(frame,f"Depth:{depth}cm Size:{area_sq_m:.2f}",
+                        (x1+5,start_y+20),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+
+            speeds.append(pothole_speed(area_px))
+
+            csvwriter.writerow([track_id,frame_num,size,depth,severity,distance])
+
+        if speeds:
+
+            cv2.putText(frame,f"Recommended Speed: {min(speeds)} km/h",
+                        (30,40),
+                        cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),3)
+
+        height,width = frame.shape[:2]
+
+        cv2.putText(frame,f"Total Unique Potholes: {len(unique_ids)}",
+                    (int(width/2)-200,height-20),
+                    cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),3)
+
+        ret,buffer = cv2.imencode(".jpg",frame)
+        frame_bytes = buffer.tobytes()
+
+        yield(b'--frame\r\n'
+              b'Content-Type: image/jpeg\r\n\r\n'+frame_bytes+b'\r\n')
+
+    csvfile.close()
+    cap.release()
+
+# --------------------
+# Flask route
+# --------------------
+@app.route("/",methods=["GET","POST"])
 def index():
 
-    output_image=None
+    output_image = None
 
     if request.method=="POST":
 
-        file = request.files.get("file")
+        file = request.files["file"]
 
-        if not file:
-            return "No file uploaded"
+        if file:
 
-        ext=file.filename.split(".")[-1].lower()
-        model=get_model()
+            ext = file.filename.split(".")[-1].lower()
 
-        # ---------------- IMAGE ----------------
-        if ext in ["jpg","jpeg","png"]:
+            model = get_model()
 
-            tmp="temp.jpg"
-            file.save(tmp)
+            if ext in ["jpg","jpeg","png"]:
 
-            img=cv2.imread(tmp)
+                tmp = "temp.jpg"
+                file.save(tmp)
 
-            if img is None:
-                return "Image read error"
+                img = cv2.imread(tmp)
+                img = cv2.resize(img,(640,640))
 
-            img=cv2.resize(img,(640,640))
+                speeds = []
 
-            results=model(img,conf=0.4,imgsz=416)
+                results = model(img,conf=0.25,imgsz=640)
 
-            speeds=[]
-            pothole_count=0
+                pothole_count = 0
 
-            for r in results:
-                for box in r.boxes.xyxy:
+                for r in results:
 
-                    x1,y1,x2,y2=map(int,box)
+                    for box in r.boxes.xyxy:
 
-                    box_width=x2-x1
-                    area_px=box_width*(y2-y1)
+                        x1,y1,x2,y2 = map(int,box)
 
-                    size,color,area_sq_m,severity=pothole_info(area_px)
-                    depth=pothole_depth(area_px)
-                    distance=pothole_distance(x1,x2)
+                        box_width = x2-x1
+                        area_px = box_width*(y2-y1)
 
-                    cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
+                        size,color,area_sq_m,severity = pothole_info(area_px)
 
-                    start_y=y2+20
+                        depth = pothole_depth(area_px)
 
-                    cv2.putText(img,f"{size} | {severity} | Dist:{distance}m",
-                                (x1+5,start_y),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+                        distance = pothole_distance(x1,x2)
 
-                    cv2.putText(img,f"Depth:{depth}cm  Size:{area_sq_m:.2f}",
-                                (x1+5,start_y+20),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+                        cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
 
-                    speeds.append(pothole_speed(area_px))
-                    pothole_count+=1
+                        start_y = y2+20
 
-            if speeds:
-                cv2.putText(img,f"Recommended Speed: {min(speeds)} km/h",
-                            (30,40),
-                            cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),3)
+                        cv2.putText(img,
+                                    f"{size} | {severity} | Distance:{distance} m",
+                                    (x1+5,start_y),
+                                    cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
 
-            h,w=img.shape[:2]
+                        cv2.putText(img,
+                                    f"Depth:{depth}cm Size:{area_sq_m:.2f}",
+                                    (x1+5,start_y+20),
+                                    cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
 
-            cv2.putText(img,f"Total Potholes: {pothole_count}",
-                        (int(w/2)-150,h-20),
-                        cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),3)
+                        speeds.append(pothole_speed(area_px))
 
-            output_path=os.path.join("static","output.jpg")
-            cv2.imwrite(output_path,img)
+                        pothole_count += 1
 
-            output_image="output.jpg"
+                if speeds:
 
+                    cv2.putText(img,
+                                f"Recommended Speed: {min(speeds)} km/h",
+                                (30,40),
+                                cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),3)
 
-    return render_template("index.html", output_image=output_image)
+                height,width = img.shape[:2]
 
+                cv2.putText(img,
+                            f"Total Potholes: {pothole_count}",
+                            (int(width/2)-150,height-20),
+                            cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),3)
 
+                cv2.imwrite("static/output.jpg",img)
+
+                output_image = "output.jpg"
+
+            elif ext in ["mp4","avi","mov","mkv"]:
+
+                tmp="temp_video.mp4"
+                file.save(tmp)
+
+                return Response(generate_frames(tmp),
+                                mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    return render_template("index.html",output_image=output_image)
+
+# ---- Render port fix ----
 if __name__=="__main__":
-    port=int(os.environ.get("PORT",10000))
+
+    port = int(os.environ.get("PORT",10000))
+
     app.run(host="0.0.0.0",port=port)
